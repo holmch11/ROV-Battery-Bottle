@@ -1,0 +1,6 @@
+Adafruit CircuitPython 10.0.1 on 2025-10-09; Adafruit Feather ESP32S2 with ESP32S2
+Board ID:adafruit_feather_esp32s2
+UID:487F301F866F
+MAC:40:C8:FD:3F:10:F1
+boot.py output:
+boot.py: SD mount failed: no SD card
