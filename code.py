@@ -276,6 +276,8 @@ while True:
                     )
                 )
             else:
+                # Placeholder for real deep-sleep; just announce it for now while testing.
+                print("sleep")
                 if battery_volts >= BATTERY_PRESENT_VOLTAGE:
                     if last_snapshot_time is None or now - last_snapshot_time >= SNAPSHOT_INTERVAL_SECONDS:
                         reading = build_reading(
