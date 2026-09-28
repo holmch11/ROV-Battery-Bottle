@@ -31,7 +31,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 Revision History
 #####################################################################################
 2025/12/01 CEH Initial Version
-
+2026/09/28 
 
 
 ####################################################################################
@@ -48,6 +48,7 @@ import terminalio
 from adafruit_display_text import label
 import adafruit_imageload
 import analogio
+import digitalio
 import json
 try:
     from adafruit_bitmap_tools import bitmaptools
@@ -88,63 +89,71 @@ ACS770_ZERO_CURRENT = 2.5  # V at zero current
 current_pin = analogio.AnalogIn(board.A0)
 battery_pin = analogio.AnalogIn(board.A1)
 
-# Total consumption (mAh) since last reset; try to persist on SD at /sd/total_mAh.txt
-TOTAL_PATH = "/sd/total_mAh.txt"
-total_mAh = 0.0
-LAST_SAMPLE_PATH = "/sd/last_sample.json"
+REED_PIN = board.D12
+REED_ACTIVE_HIGH = True
+REED_DEBOUNCE_SECONDS = 0.03
+MIN_DISPLAY_REFRESH_INTERVAL_SECONDS = 180
+reed = digitalio.DigitalInOut(REED_PIN)
+reed.direction = digitalio.Direction.INPUT
+reed.pull = digitalio.Pull.DOWN if REED_ACTIVE_HIGH else digitalio.Pull.UP
+
+# Rolling snapshot history on the SD card
 READINGS_PATH = "/sd/readings.txt"
+MAX_SAVED_READINGS = 4
+CURRENT_THRESHOLD_AMPS = 0.8
+BATTERY_PRESENT_VOLTAGE = 1.0
+SAMPLE_INTERVAL_SECONDS = 1
+SNAPSHOT_INTERVAL_SECONDS = 200
+REED_POLL_INTERVAL_SECONDS = 0.01
 
-def load_total_mAh():
-    global total_mAh
-    try:
-        with open(TOTAL_PATH, "r") as f:
-            total_mAh = float(f.read().strip())
-    except Exception:
-        total_mAh = 0.0
+draw_total_mAh = 0.0
+draw_active = False
+last_high_current_amps = None
+last_high_current_time = None
+last_reed_raw = reed.value
+stable_reed_active = reed.value if REED_ACTIVE_HIGH else not reed.value
+reed_raw_change_time = time.monotonic()
 
-def save_total_mAh():
-    try:
-        with open(TOTAL_PATH, "w") as f:
-            f.write(str(total_mAh))
-    except Exception:
-        pass
+def detect_magnet_swipe(now):
+    global last_reed_raw, stable_reed_active, reed_raw_change_time
+    raw = reed.value
+    if raw != last_reed_raw:
+        last_reed_raw = raw
+        reed_raw_change_time = now
 
-def load_last_sample():
-    try:
-        with open(LAST_SAMPLE_PATH, "r") as f:
-            return json.load(f)
-    except Exception:
-        return None
+    if now - reed_raw_change_time >= REED_DEBOUNCE_SECONDS:
+        active = raw if REED_ACTIVE_HIGH else not raw
+        if active != stable_reed_active:
+            stable_reed_active = active
+            return active
+    return False
 
-def save_last_sample(sample):
-    try:
-        with open(LAST_SAMPLE_PATH, "w") as f:
-            json.dump(sample, f)
-    except Exception:
-        pass
-
-def append_reading_to_sd(entry):
-    try:
-        with open(READINGS_PATH, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass
-
-def load_last_readings(n=2):
+def load_last_readings(n=MAX_SAVED_READINGS):
     out = []
     try:
         with open(READINGS_PATH, "r") as f:
             lines = [ln.strip() for ln in f if ln.strip()]
-        # parse JSON lines
-        for ln in lines[-n:]:
+        for ln in reversed(lines):
             try:
-                out.append(json.loads(ln))
+                out.insert(0, json.loads(ln))
             except Exception:
-                # fallback parse: skip
                 continue
+            if len(out) >= n:
+                break
     except Exception:
         pass
     return out
+
+def append_reading_to_sd(entry):
+    readings = load_last_readings(MAX_SAVED_READINGS)
+    readings.append(entry)
+    readings = readings[-MAX_SAVED_READINGS:]
+    try:
+        with open(READINGS_PATH, "w") as f:
+            for reading in readings:
+                f.write(json.dumps(reading) + "\n")
+    except Exception:
+        pass
 
 def read_current(pin):
     raw = pin.value
@@ -158,214 +167,131 @@ def read_voltage(pin):
     return v
 
 
-# Compose an in-RAM bitmap: logo on left, three latest BME280 readings on right
-def compose_and_show_once(display, bme, logo_candidates=("/sd/logo_1bit.bmp", "/logo_1bit.bmp", "logo_1bit.bmp"), measurements=3, interval_s=1):
-    # Behavior now: load last two readings from SD, take one new measurement
-    load_total_mAh()
-    global total_mAh
-    prev_samples = load_last_readings(2)
-
-    # Take a single new measurement
+def read_environment(bme):
     try:
-        temp = bme.temperature
-        press = bme.pressure
-        hum = bme.humidity
+        return bme.temperature, bme.pressure, bme.humidity
     except Exception:
-        temp = None
-        press = None
-        hum = None
+        return None, None, None
+
+def make_timestamp():
     try:
-        amps = read_current(current_pin)
+        value = time.localtime()
+        return f"{value[0]:04d}-{value[1]:02d}-{value[2]:02d} {value[3]:02d}:{value[4]:02d}:{value[5]:02d}"
     except Exception:
-        amps = 0.0
-    try:
-        volt = read_voltage(battery_pin)
-    except Exception:
-        volt = 0.0
+        return "----/-- --:--"
 
-    # timestamp (store full date + time)
-    try:
-        ts = int(time.time())
-        t_struct = time.localtime(ts)
-        timestamp = f"{t_struct[0]:04d}-{t_struct[1]:02d}-{t_struct[2]:02d} {t_struct[3]:02d}:{t_struct[4]:02d}:{t_struct[5]:02d}"
-    except Exception:
-        timestamp = "----:--:-- --:--:--"
-        ts = 0
-
-    # Trapezoidal integration using persisted last sample
-    last = load_last_sample()
-    if last and isinstance(last, dict) and "amps" in last and "ts" in last:
-        dt = max(0, ts - int(last["ts"]))
-        # hours
-        dh = dt / 3600.0
-        # trapezoid area (A) -> mAh
-        total_mAh += ((float(last["amps"]) + amps) / 2.0) * dh * 1000.0
-    else:
-        # no previous sample; assume no integration
-        pass
-
-    # Save total and last sample once per run
-    save_total_mAh()
-    save_last_sample({"amps": amps, "ts": ts})
-
-    # Create a canonical entry for SD and display
-    new_entry = {
-        "ts": timestamp,
+def build_reading(temp, press, hum, amps, volts):
+    return {
+        "ts": make_timestamp(),
         "amps": round(amps, 3),
-        "volts": round(volt, 3),
+        "volts": round(volts, 3),
         "press": round(press, 1) if press is not None else None,
         "temp": round(temp, 1) if temp is not None else None,
         "hum": round(hum, 0) if hum is not None else None,
-        "total_mAh": int(total_mAh),
     }
-    append_reading_to_sd(new_entry)
 
-    # Build readings list with newest first: new, then previous entries (most recent first)
-    readings = [new_entry]
-    if prev_samples:
-        # prev_samples comes oldest->newest; reverse to newest->oldest
-        for p in reversed(prev_samples):
-            readings.append(p)
+def display_readings(display, readings):
+    group = displayio.Group()
+    row_height = max(1, int((display.height - 16) / max(1, len(readings))))
+    line_height = min(12, max(9, int((row_height - 4) / 4)))
+    for index, reading in enumerate(reversed(readings[-3:])):
+        timestamp = reading.get("ts", "")
+        if len(timestamp) >= 16 and timestamp[4] == "-":
+            timestamp = timestamp[5:7] + "/" + timestamp[8:10] + " " + timestamp[11:16]
+        prefix = ("NOW", "-1", "-2")[index]
+        temp = reading.get("temp")
+        humidity = reading.get("hum")
+        pressure = reading.get("press")
+        volts = reading.get("volts")
+        amps = reading.get("amps")
+        lines = (
+            f"{prefix} {timestamp}",
+            f"T {temp:.1f}C  H {humidity:.0f}%" if temp is not None and humidity is not None else "T --  H --",
+            f"P {pressure:.1f}hPa" if pressure is not None else "P --",
+            f"V {volts:.2f}V  I {amps:.2f}A" if volts is not None and amps is not None else "V --  I --",
+        )
+        start_y = 8 + index * row_height
+        for line_index, text in enumerate(lines):
+            text_label = label.Label(terminalio.FONT, text=text, color=0x000000)
+            text_label.x = 4
+            text_label.y = start_y + line_index * line_height
+            group.append(text_label)
 
-    # Find logo path
-    logo_path = None
-    for p in logo_candidates:
-        try:
-            os.stat(p)
-            logo_path = p
-            break
-        except Exception:
-            continue
-
-    disp_w = display.width
-    disp_h = display.height
-
-    # Destination in-RAM bitmap (1-bit: 2 colors)
-    dest = displayio.Bitmap(disp_w, disp_h, 2)
-    palette = displayio.Palette(2)
-    palette[0] = 0xFFFFFF  # white
-    palette[1] = 0x000000  # black
-
-    # If imageload and a logo exists, load it and paste into dest (if bitmaptools available)
-    if logo_path:
-        try:
-            logo_bmp, logo_pal = adafruit_imageload.load(logo_path, bitmap=displayio.Bitmap, palette=displayio.Palette)
-            logo_w = logo_bmp.width
-            logo_h = logo_bmp.height
-            if bitmaptools:
-                try:
-                    bitmaptools.paste(logo_bmp, dest, 0, 0)
-                except Exception:
-                    # fallback: use TileGrid with group compositing below
-                    logo_bmp = None
-            else:
-                # no bitmaptools: we'll composite by using a TileGrid for the logo
-                logo_bmp = logo_bmp
-        except Exception:
-            logo_bmp = None
-            logo_w = 0
-            logo_h = 0
-    else:
-        logo_bmp = None
-        logo_w = 0
-        logo_h = 0
-
-    # Prepare text labels (right side) from multiple readings
-    text_x = min(logo_w + 8, disp_w - 120)
-    # Build three lines per measurement: full timestamp, environmental, then electrical/total
-    lines = []
-    for r in readings:
-        ts = r.get("ts", "----:--:-- --:--:--")
-        p = r.get("press")
-        t = r.get("temp")
-        h = r.get("hum")
-        a = r.get("amps")
-        v = r.get("volts")
-        tot = r.get("total_mAh")
-        p_str = f"{p:.1f}hPa" if p is not None else "--"
-        t_str = f"{t:.1f}C" if t is not None else "--"
-        h_str = f"{int(h)}%" if h is not None else "--"
-        # Format electrical values: current 1 decimal, voltage 2 decimals
-        try:
-            a_str = f"{float(a):.1f}"
-        except Exception:
-            a_str = "--"
-        try:
-            v_str = f"{float(v):.2f}"
-        except Exception:
-            v_str = "--"
-        tot_str = f"{int(tot)}" if tot is not None else "--"
-        lines.append(f"{ts}")
-        lines.append(f"P:{p_str} T:{t_str} H:{h_str}")
-        lines.append(f"I:{a_str}A V:{v_str}V Tot:{tot_str}mAh")
-
-    # Build final group: if we couldn't paste into dest, use group layering
-    if logo_bmp is None or bitmaptools is None:
-        g = displayio.Group()
-        # Add white background
-        bg = displayio.TileGrid(dest, pixel_shader=palette)
-        g.append(bg)
-        # If a logo exists, show it left using TileGrid
-        try:
-            if logo_path:
-                ondisk = displayio.OnDiskBitmap(logo_path)
-                tg_logo = displayio.TileGrid(ondisk, pixel_shader=ondisk.pixel_shader, x=0, y=0)
-                g.append(tg_logo)
-        except Exception:
-            pass
-
-        # Add text labels using adafruit_display_text (stack vertically)
-        for idx, ln in enumerate(lines):
-            lab = label.Label(terminalio.FONT, text=ln, color=0x000000)
-            lab.x = text_x
-            # spread the readings evenly; baseline offset 12
-            lab.y = 12 + idx * int((disp_h - 24) / max(1, len(lines)))
-            g.append(lab)
-
-        display.root_group = g
-        try:
-            display.refresh()
-        except Exception:
-            # some drivers auto-refresh on show
-            pass
-        return
-
-    # If we reached here, bitmaptools.paste succeeded and dest contains logo; now render text onto dest
-    # Create a TileGrid from dest and group
-    tg = displayio.TileGrid(dest, pixel_shader=palette, x=0, y=0)
-    g = displayio.Group()
-    g.append(tg)
-
-    # Add textual labels (these are rendered as separate TileGrids; they will composite over dest)
-    for idx, ln in enumerate(lines):
-        lab = label.Label(terminalio.FONT, text=ln, color=0x000000)
-        lab.x = text_x
-        lab.y = 12 + idx * int((disp_h - 24) / max(1, len(lines)))
-        g.append(lab)
-
-    display.root_group = g
+    display.root_group = group
     try:
         display.refresh()
     except Exception:
         pass
 
+def update_draw_total(amps, now):
+    global draw_total_mAh, draw_active
+    global last_high_current_amps, last_high_current_time
+    if amps > CURRENT_THRESHOLD_AMPS:
+        if draw_active and last_high_current_time is not None:
+            elapsed_hours = max(0, now - last_high_current_time) / 3600.0
+            draw_total_mAh += (last_high_current_amps + amps) * 0.5 * elapsed_hours * 1000.0
+        draw_active = True
+        last_high_current_amps = amps
+        last_high_current_time = now
+    else:
+        draw_total_mAh = 0.0
+        draw_active = False
+        last_high_current_amps = None
+        last_high_current_time = None
 
-# Run composition repeatedly at ~200 second intervals (display update cadence)
-SLEEP_SECONDS = 200
+last_snapshot_time = None
+last_sample_time = 0.0
+last_display_refresh = None
+display_initialized = False
 while True:
     try:
-        # Recreate the display each cycle to ensure a full fresh update
-        displayio.release_displays()
-        time.sleep(0.05)
-        display_bus = FourWire(spi, command=epd_dc, chip_select=epd_cs, reset=epd_reset, baudrate=1000000)
-        time.sleep(0.05)
-        display = adafruit_uc8151d.UC8151D(display_bus, width=296, height=128, rotation=90, busy_pin=epd_busy)
-        compose_and_show_once(display, bme280)
-    except Exception as e:
-        print("Error composing/showing BMP:", e)
-    try:
-        time.sleep(SLEEP_SECONDS)
-    except Exception:
-        # If sleep interrupted, continue
-        pass
+        now = time.monotonic()
+        if detect_magnet_swipe(now):
+            if (
+                display_initialized
+                and last_display_refresh is not None
+                and now - last_display_refresh >= MIN_DISPLAY_REFRESH_INTERVAL_SECONDS
+                and read_current(current_pin) <= CURRENT_THRESHOLD_AMPS
+            ):
+                display_readings(display, load_last_readings(MAX_SAVED_READINGS))
+                last_display_refresh = now
+
+        if now - last_sample_time >= SAMPLE_INTERVAL_SECONDS:
+            last_sample_time = now
+            temperature, pressure, humidity = read_environment(bme280)
+            current_amps = read_current(current_pin)
+            battery_volts = read_voltage(battery_pin)
+            update_draw_total(current_amps, now)
+
+            if current_amps > CURRENT_THRESHOLD_AMPS:
+                print(
+                    "humidity={:.1f}% pressure={:.1f}hPa temperature={:.1f}C "
+                    "battery_voltage={:.2f}V current={:.0f}mA draw_total={:.2f}mAh".format(
+                        humidity if humidity is not None else 0.0,
+                        pressure if pressure is not None else 0.0,
+                        temperature if temperature is not None else 0.0,
+                        battery_volts,
+                        current_amps * 1000.0,
+                        draw_total_mAh,
+                    )
+                )
+            else:
+                if battery_volts >= BATTERY_PRESENT_VOLTAGE:
+                    if last_snapshot_time is None or now - last_snapshot_time >= SNAPSHOT_INTERVAL_SECONDS:
+                        reading = build_reading(
+                            temperature, pressure, humidity, current_amps, battery_volts
+                        )
+                        append_reading_to_sd(reading)
+                        last_snapshot_time = now
+
+                if not display_initialized:
+                    display_readings(display, load_last_readings(MAX_SAVED_READINGS))
+                    display_initialized = True
+                    last_display_refresh = now
+
+                if battery_volts < BATTERY_PRESENT_VOLTAGE:
+                    last_snapshot_time = None
+    except Exception as error:
+        print("Measurement error:", error)
+    time.sleep(REED_POLL_INTERVAL_SECONDS)
 
