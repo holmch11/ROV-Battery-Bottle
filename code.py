@@ -82,6 +82,7 @@ g = displayio.Group()
 # Electrical measurement constants (matching test harness)
 VOLTAGE_DIVIDER_A0 = (1000 + 2000) / 2000  # current sensor output divider
 VOLTAGE_DIVIDER_A1 = (160000 + 40200) / 40200  # battery voltage divider
+BATTERY_VOLTAGE_CAL = 14.15 / 13.08  # multimeter (14.15V) vs measured (13.08V)
 ACS770_SENSITIVITY = 0.0133  # V/A
 ACS770_ZERO_CURRENT = 2.5  # V at zero current
 
@@ -163,7 +164,7 @@ def read_current(pin):
 
 def read_voltage(pin):
     raw = pin.value
-    v = (raw / 65535) * 3.3 * VOLTAGE_DIVIDER_A1
+    v = (raw / 65535) * 3.3 * VOLTAGE_DIVIDER_A1 * BATTERY_VOLTAGE_CAL
     return v
 
 
