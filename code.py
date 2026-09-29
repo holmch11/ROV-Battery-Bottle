@@ -106,9 +106,6 @@ BATTERY_PRESENT_VOLTAGE = 1.0
 SAMPLE_INTERVAL_SECONDS = 1
 SNAPSHOT_INTERVAL_SECONDS = 200
 REED_POLL_INTERVAL_SECONDS = 0.01
-# TEMP: current sensor wiring is unresolved and reads bogus-high; force the low-current
-# (SD/e-ink) path so that logic can be tested. Set back to False once current sensing works.
-FORCE_LOW_CURRENT_FOR_TESTING = True
 
 draw_total_mAh = 0.0
 draw_active = False
@@ -196,6 +193,11 @@ def build_reading(temp, press, hum, amps, volts):
 
 def display_readings(display, readings):
     group = displayio.Group()
+    background_bitmap = displayio.Bitmap(display.width, display.height, 2)
+    background_palette = displayio.Palette(2)
+    background_palette[0] = 0xFFFFFF
+    background_palette[1] = 0x000000
+    group.append(displayio.TileGrid(background_bitmap, pixel_shader=background_palette))
     row_height = max(1, int((display.height - 16) / max(1, len(readings))))
     line_height = min(12, max(9, int((row_height - 4) / 4)))
     for index, reading in enumerate(reversed(readings[-3:])):
@@ -266,7 +268,7 @@ while True:
             battery_volts = read_voltage(battery_pin)
             update_draw_total(current_amps, now)
 
-            if current_amps > CURRENT_THRESHOLD_AMPS and not FORCE_LOW_CURRENT_FOR_TESTING:
+            if current_amps > CURRENT_THRESHOLD_AMPS:
                 print(
                     "humidity={:.1f}% pressure={:.1f}hPa temperature={:.1f}C "
                     "battery_voltage={:.2f}V current={:.0f}mA draw_total={:.2f}mAh".format(
@@ -289,13 +291,13 @@ while True:
                         append_reading_to_sd(reading)
                         last_snapshot_time = now
 
-                if not display_initialized:
-                    display_readings(display, load_last_readings(MAX_SAVED_READINGS))
-                    display_initialized = True
-                    last_display_refresh = now
-
                 if battery_volts < BATTERY_PRESENT_VOLTAGE:
                     last_snapshot_time = None
+
+            if not display_initialized:
+                display_readings(display, load_last_readings(MAX_SAVED_READINGS))
+                display_initialized = True
+                last_display_refresh = now
     except Exception as error:
         print("Measurement error:", error)
     time.sleep(REED_POLL_INTERVAL_SECONDS)
