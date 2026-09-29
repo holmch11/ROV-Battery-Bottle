@@ -106,6 +106,9 @@ BATTERY_PRESENT_VOLTAGE = 1.0
 SAMPLE_INTERVAL_SECONDS = 1
 SNAPSHOT_INTERVAL_SECONDS = 200
 REED_POLL_INTERVAL_SECONDS = 0.01
+# TEMP: current sensor wiring is unresolved and reads bogus-high; force the low-current
+# (SD/e-ink) path so that logic can be tested. Set back to False once current sensing works.
+FORCE_LOW_CURRENT_FOR_TESTING = True
 
 draw_total_mAh = 0.0
 draw_active = False
@@ -252,7 +255,6 @@ while True:
                 display_initialized
                 and last_display_refresh is not None
                 and now - last_display_refresh >= MIN_DISPLAY_REFRESH_INTERVAL_SECONDS
-                and read_current(current_pin) <= CURRENT_THRESHOLD_AMPS
             ):
                 display_readings(display, load_last_readings(MAX_SAVED_READINGS))
                 last_display_refresh = now
@@ -264,7 +266,7 @@ while True:
             battery_volts = read_voltage(battery_pin)
             update_draw_total(current_amps, now)
 
-            if current_amps > CURRENT_THRESHOLD_AMPS:
+            if current_amps > CURRENT_THRESHOLD_AMPS and not FORCE_LOW_CURRENT_FOR_TESTING:
                 print(
                     "humidity={:.1f}% pressure={:.1f}hPa temperature={:.1f}C "
                     "battery_voltage={:.2f}V current={:.0f}mA draw_total={:.2f}mAh".format(
